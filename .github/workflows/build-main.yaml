@@ -1,0 +1,142 @@
+---
+name: build-main
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force rebuild even if commit already published"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # daily at 04:17 UTC — track upstream main branch
+    - cron: "17 4 * * *"
+
+env:
+  UPSTREAM_REPO: harry0703/MoneyPrinterTurbo
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/moneyprinter-turbo
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  resolve:
+    name: resolve upstream main sha
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+      short_sha: ${{ steps.pick.outputs.short_sha }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: pick commit
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA="$(gh api "repos/${UPSTREAM_REPO}/commits/main" --jq .sha)"
+          if [[ -z "${SHA}" || "${SHA}" == "null" ]]; then
+            echo "could not resolve upstream main sha" >&2
+            exit 1
+          fi
+          SHORT="${SHA:0:7}"
+          echo "sha=${SHA}" >>"${GITHUB_OUTPUT}"
+          echo "short_sha=${SHORT}" >>"${GITHUB_OUTPUT}"
+          echo "resolved upstream main sha: ${SHA} (${SHORT})"
+
+      - name: check if commit already published
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHORT: ${{ steps.pick.outputs.short_sha }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [[ "${FORCE}" == "true" ]]; then
+            echo "should_build=true" >>"${GITHUB_OUTPUT}"
+            echo "force=true → rebuild"
+            exit 0
+          fi
+          set +e
+          EXISTS="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/orgs/${{ github.repository_owner }}/packages/container/moneyprinter-turbo/versions" \
+            --jq "[.[] | .metadata.container.tags[]] | map(select(. == \"main-${SHORT}\")) | length" 2>/dev/null)"
+          set -e
+          if [[ "${EXISTS:-0}" -gt 0 ]]; then
+            echo "should_build=false" >>"${GITHUB_OUTPUT}"
+            echo "commit main-${SHORT} already published → skip"
+          else
+            echo "should_build=true" >>"${GITHUB_OUTPUT}"
+            echo "commit main-${SHORT} not yet published → build"
+          fi
+
+  build:
+    name: build ${{ matrix.flavor }}
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: cpu
+            dockerfile: Dockerfile
+            suffix: ""
+            platforms: linux/amd64
+            moving_tag: main
+          - flavor: gpu
+            dockerfile: Dockerfile.gpu
+            suffix: "-gpu"
+            platforms: linux/amd64
+            moving_tag: main-gpu
+    steps:
+      - name: checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: set up qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: login to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=main-${{ needs.resolve.outputs.short_sha }}${{ matrix.suffix }}
+            type=raw,value=${{ matrix.moving_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.description=MoneyPrinterTurbo (${{ matrix.flavor }}) built from upstream main @ ${{ needs.resolve.outputs.short_sha }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.version=main-${{ needs.resolve.outputs.short_sha }}
+
+      - name: build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=main-${{ matrix.flavor }}
+          cache-to: type=gha,scope=main-${{ matrix.flavor }},mode=max
+          provenance: false

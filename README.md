@@ -8,20 +8,26 @@ No upstream source code is mirrored here. Each build checks out the tagged commi
 
 ## Images
 
-| Variant | Tag pattern                                          | Dockerfile       |
-| ------- | ---------------------------------------------------- | ---------------- |
-| CPU     | `ghcr.io/xinitteam/moneyprinter-turbo:<version>`     | `Dockerfile`     |
-| CPU     | `ghcr.io/xinitteam/moneyprinter-turbo:latest`        | `Dockerfile`     |
-| GPU     | `ghcr.io/xinitteam/moneyprinter-turbo:<version>-gpu` | `Dockerfile.gpu` |
-| GPU     | `ghcr.io/xinitteam/moneyprinter-turbo:latest-gpu`    | `Dockerfile.gpu` |
+| Variant | Tag pattern                                                 | Source           | Dockerfile       |
+| ------- | ----------------------------------------------------------- | ---------------- | ---------------- |
+| CPU     | `ghcr.io/xinitteam/moneyprinter-turbo:<version>`            | upstream release | `Dockerfile`     |
+| CPU     | `ghcr.io/xinitteam/moneyprinter-turbo:latest`               | upstream release | `Dockerfile`     |
+| CPU     | `ghcr.io/xinitteam/moneyprinter-turbo:main-<short-sha>`     | upstream `main`  | `Dockerfile`     |
+| CPU     | `ghcr.io/xinitteam/moneyprinter-turbo:main`                 | upstream `main`  | `Dockerfile`     |
+| GPU     | `ghcr.io/xinitteam/moneyprinter-turbo:<version>-gpu`        | upstream release | `Dockerfile.gpu` |
+| GPU     | `ghcr.io/xinitteam/moneyprinter-turbo:latest-gpu`           | upstream release | `Dockerfile.gpu` |
+| GPU     | `ghcr.io/xinitteam/moneyprinter-turbo:main-<short-sha>-gpu` | upstream `main`  | `Dockerfile.gpu` |
+| GPU     | `ghcr.io/xinitteam/moneyprinter-turbo:main-gpu`             | upstream `main`  | `Dockerfile.gpu` |
 
-`<version>` matches the upstream release tag (e.g. `v1.2.7`).
+`<version>` matches the upstream release tag (e.g. `v1.2.7`). `<short-sha>` is the 7-character abbreviation of the upstream `main` commit.
 
 ## How it works
 
-- **Schedule**: a cron job runs daily at `03:17 UTC` and queries the latest upstream release.
-- **Idempotency**: if an image for that tag already exists in GHCR, the build is skipped.
-- **Manual dispatch**: trigger `build` via the Actions tab with an explicit `tag` input (and optional `force` to rebuild).
+Two workflows run independently:
+
+- **`build`** (release tags): daily at `03:17 UTC`, picks the latest upstream release and builds it. Manual dispatch accepts an explicit `tag` input.
+- **`build-main`** (rolling main): daily at `04:17 UTC`, picks the current `HEAD` of upstream `main` and builds it. Tagged with `main-<short-sha>` for traceability plus the moving `main` tag.
+- **Idempotency**: if an image for that tag (release tag or `main-<short-sha>`) already exists in GHCR, the build is skipped. Override with the `force` input.
 - **No secrets required**: authentication to GHCR uses the workflow's `GITHUB_TOKEN`.
 
 ## Usage

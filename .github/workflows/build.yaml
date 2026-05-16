@@ -1,0 +1,148 @@
+---
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (e.g. v1.2.7). Leave empty to use latest release."
+        required: false
+        type: string
+      force:
+        description: "Force rebuild even if image already exists"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # daily at 03:17 UTC — poll upstream for new releases
+    - cron: "17 3 * * *"
+
+env:
+  UPSTREAM_REPO: harry0703/MoneyPrinterTurbo
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/moneyprinter-turbo
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  resolve:
+    name: resolve upstream tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: pick tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
+          fi
+          if [[ -z "${TAG}" || "${TAG}" == "null" ]]; then
+            echo "could not resolve upstream tag" >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >>"${GITHUB_OUTPUT}"
+          echo "resolved upstream tag: ${TAG}"
+
+      - name: check if image already published
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [[ "${FORCE}" == "true" ]]; then
+            echo "should_build=true" >>"${GITHUB_OUTPUT}"
+            echo "force=true → rebuild"
+            exit 0
+          fi
+          # query package versions; ignore failures (package may not exist yet)
+          set +e
+          EXISTS="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/orgs/${{ github.repository_owner }}/packages/container/moneyprinter-turbo/versions" \
+            --jq "[.[] | .metadata.container.tags[]] | map(select(. == \"${TAG}\")) | length" 2>/dev/null)"
+          set -e
+          if [[ "${EXISTS:-0}" -gt 0 ]]; then
+            echo "should_build=false" >>"${GITHUB_OUTPUT}"
+            echo "tag ${TAG} already published → skip"
+          else
+            echo "should_build=true" >>"${GITHUB_OUTPUT}"
+            echo "tag ${TAG} not yet published → build"
+          fi
+
+  build:
+    name: build ${{ matrix.flavor }}
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: cpu
+            dockerfile: Dockerfile
+            suffix: ""
+            platforms: linux/amd64
+            latest_tag: latest
+          - flavor: gpu
+            dockerfile: Dockerfile.gpu
+            suffix: "-gpu"
+            platforms: linux/amd64
+            latest_tag: latest-gpu
+    steps:
+      - name: checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: set up qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: login to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.resolve.outputs.tag }}${{ matrix.suffix }}
+            type=raw,value=${{ matrix.latest_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.description=MoneyPrinterTurbo (${{ matrix.flavor }}) built from upstream tag ${{ needs.resolve.outputs.tag }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
+
+      - name: build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.flavor }}
+          cache-to: type=gha,scope=${{ matrix.flavor }},mode=max
+          provenance: false
